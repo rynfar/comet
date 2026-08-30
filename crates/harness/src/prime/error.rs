@@ -32,6 +32,15 @@ pub enum PrimeDaemonError {
     },
     #[error("Prime Agent bridge emitted an invalid control frame ({reason})")]
     InvalidBridgeFrame { reason: &'static str },
+    #[error("Prime Agent session host emitted an invalid control frame ({reason})")]
+    InvalidSessionHostFrame { reason: &'static str },
+    #[error("Prime Agent session {stage} failed ({code})")]
+    Session {
+        stage: &'static str,
+        code: &'static str,
+    },
+    #[error("Prime Agent owned-session cleanup is uncertain")]
+    CleanupUncertain,
 }
 
 impl PrimeDaemonError {
@@ -48,6 +57,34 @@ impl From<PrimeDaemonError> for crate::HarnessError {
         match error {
             PrimeDaemonError::NotInstalled { reason } => Self::NotInstalled(reason.into()),
             other => Self::Protocol(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_errors_are_fixed_sanitized_protocol_failures() {
+        let errors = [
+            PrimeDaemonError::InvalidSessionHostFrame {
+                reason: "response kind is invalid",
+            },
+            PrimeDaemonError::Session {
+                stage: "attach",
+                code: "host-operation-failed",
+            },
+            PrimeDaemonError::CleanupUncertain,
+        ];
+        for error in errors {
+            let message = error.to_string();
+            assert!(!message.contains("/private/"));
+            assert!(!message.contains("active-session"));
+            assert!(matches!(
+                crate::HarnessError::from(error),
+                crate::HarnessError::Protocol(_)
+            ));
         }
     }
 }

@@ -23,6 +23,7 @@ pub(super) struct PrimePaths {
     pub socket: PathBuf,
     pub session_dir: PathBuf,
     pub shim: PathBuf,
+    pub session_shim: PathBuf,
     _owner_lock: File,
 }
 
@@ -74,6 +75,7 @@ impl PrimePaths {
         let runtime_dir = create_runtime_dir(&transport_dir)?;
         Ok(Self {
             shim: runtime_dir.join("bootstrap-bridge.mjs"),
+            session_shim: runtime_dir.join("session-host.mjs"),
             runtime_dir,
             socket,
             session_dir,
@@ -398,6 +400,17 @@ mod tests {
         let first_socket = first.socket.clone();
         let first_session = first.session_dir.clone();
         let first_runtime = first.runtime_dir.clone();
+        assert_eq!(
+            first.session_shim.parent(),
+            Some(first.runtime_dir.as_path())
+        );
+        assert_eq!(
+            first
+                .session_shim
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("session-host.mjs")
+        );
         let error = PrimePaths::prepare(&state_path, "provider-1", &sockets_path)
             .err()
             .expect("path is rejected");
@@ -418,7 +431,11 @@ mod tests {
                 0o700
             );
         }
+        let second_runtime = second.runtime_dir.clone();
+        let second_session_shim = second.session_shim.clone();
         second.cleanup();
+        assert!(!second_runtime.exists());
+        assert!(!second_session_shim.exists());
     }
 
     #[test]

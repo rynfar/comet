@@ -4,30 +4,27 @@
 //! - [`package`] proves the configured executable belongs to the installed
 //!   package and resolves only its public root ESM export.
 //! - [`paths`] creates private host-only transport and session paths.
-//! - [`process`] owns bounded process groups and a bootstrap-only JSONL client.
-//!
-//! Session events must not reuse the bootstrap client's request/next-line
-//! shape. The next session issue must define an asynchronous SDK host that
-//! demultiplexes response IDs and normalized unsolicited events.
-//!
-//! Stock Prime may launch resident session workers as detached processes. The
-//! Unix groups here strictly own the bootstrap and daemon leaders plus ordinary
-//! descendants, but they are not proof of worker settlement. Before sessions
-//! ship, authoritative daemon shutdown and worker/descriptor reconciliation
-//! must have separate contract tests.
+//! - [`process`] owns bounded process groups and isolated SDK hosts.
 //! - [`contract`] validates the stock daemon baseline and optional offers.
+//! - [`session`] owns one capability-gated client-owned session, asynchronously
+//!   demultiplexes its bounded private control protocol, and exposes only fixed
+//!   normalized events and safe snapshot receipts.
 //!
-//! This slice starts no agent session and publishes no synchronized state.
+//! Stock Prime may launch resident session workers as detached processes. A
+//! process-group exit is never treated as worker settlement. Session close and
+//! crash recovery require the fork's authoritative owning-cleanup proof before
+//! daemon ownership can be returned.
 
 mod contract;
 mod error;
 mod package;
 mod paths;
 mod process;
+mod session;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -39,8 +36,13 @@ pub use error::PrimeDaemonError;
 use package::PrimePackage;
 use paths::PrimePaths;
 use process::{BootstrapBridge, OwnedChild, ProcessEnvironment};
+pub use session::{
+    PrimeSessionConfig, PrimeSessionEvent, PrimeSessionLease, PrimeSessionSnapshotReceipt,
+};
 
 const SHIM_SOURCE: &str = include_str!("shim.mjs");
+const SESSION_HOST_SOURCE: &str = include_str!("session/host.mjs");
+const POISON_FORCE_REAP_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Local-only configuration. Native identifiers and paths stay inside the
 /// harness process and must never be copied into Comet documents or RPC data.
@@ -125,7 +127,11 @@ pub struct PrimeDaemon {
     bridge: BootstrapBridge,
     daemon: OwnedChild,
     paths: PrimePaths,
+    package: PrimePackage,
+    session_host_environment: ProcessEnvironment,
     shutdown_timeout: Duration,
+    shutdown_request_admitted: bool,
+    daemon_exit_status: Option<std::process::ExitStatus>,
     stopped: bool,
 }
 
@@ -145,6 +151,11 @@ impl PrimeDaemon {
                     reason: "daemon deadlines must be greater than zero",
                 });
             }
+            validate_utf8_control_paths([
+                config.executable.as_path(),
+                config.state_dir.as_path(),
+                config.socket_root.as_path(),
+            ])?;
             let deadline = checked_deadline(config.startup_timeout, "daemon startup")?;
             let package_timeout =
                 remaining(deadline, "package resolution", config.startup_timeout)?;
@@ -161,9 +172,20 @@ impl PrimeDaemon {
             .map_err(|_| PrimeDaemonError::IncompatiblePackage {
                 reason: "the package resolution worker failed",
             })??;
+            validate_utf8_control_paths([package.public_entry.as_path()])?;
             let paths =
                 PrimePaths::prepare(&config.state_dir, &config.instance_id, &config.socket_root)?;
+            if let Err(error) =
+                validate_utf8_control_paths([paths.socket.as_path(), paths.session_dir.as_path()])
+            {
+                paths.cleanup();
+                return Err(error);
+            }
             if let Err(error) = paths::write_shim(&paths.shim, SHIM_SOURCE) {
+                paths.cleanup();
+                return Err(error);
+            }
+            if let Err(error) = paths::write_shim(&paths.session_shim, SESSION_HOST_SOURCE) {
                 paths.cleanup();
                 return Err(error);
             }
@@ -255,7 +277,11 @@ impl PrimeDaemon {
                 bridge,
                 daemon,
                 paths,
+                package,
+                session_host_environment: environments.session_host,
                 shutdown_timeout: config.shutdown_timeout,
+                shutdown_request_admitted: false,
+                daemon_exit_status: None,
                 stopped: false,
             })
         }
@@ -272,6 +298,13 @@ impl PrimeDaemon {
     /// transfers child handles to their reapers instead of leaving a poisoned
     /// bootstrap request channel available for reuse.
     pub async fn shutdown(mut self) -> Result<(), PrimeDaemonError> {
+        self.shutdown_in_place().await
+    }
+
+    /// Session cleanup owners call this without moving the daemon out of their
+    /// armed RAII guard. Cancellation therefore leaves Drop able to resume the
+    /// exact cleanup obligation instead of immediately killing the supervisor.
+    pub(super) async fn shutdown_in_place(&mut self) -> Result<(), PrimeDaemonError> {
         let deadline = checked_deadline(self.shutdown_timeout, "daemon shutdown")?;
         let request_timeout = remaining(deadline, "daemon shutdown", self.shutdown_timeout)?;
         let response = self
@@ -285,17 +318,29 @@ impl PrimeDaemon {
                 request_timeout,
             )
             .await;
+        // The fixed response kind distinguishes an SDK request that resolved
+        // from one the bootstrap shim could not admit to the daemon. Persist
+        // that evidence before any later await.
+        if shutdown_request_was_admitted(&response) {
+            self.shutdown_request_admitted = true;
+        }
         let mut outcome = validate_shutdown(response);
 
         if outcome.is_ok() {
             let wait_timeout = remaining(deadline, "daemon exit", self.shutdown_timeout);
             outcome = match wait_timeout {
                 Ok(timeout) => match self.daemon.wait(timeout).await {
-                    Ok(status) if status.success() => Ok(()),
-                    Ok(status) => Err(PrimeDaemonError::ProcessExit {
-                        process: self.daemon.process_name(),
-                        status: safe_status(status),
-                    }),
+                    Ok(status) if status.success() => {
+                        self.daemon_exit_status = Some(status);
+                        Ok(())
+                    }
+                    Ok(status) => {
+                        self.daemon_exit_status = Some(status);
+                        Err(PrimeDaemonError::ProcessExit {
+                            process: self.daemon.process_name(),
+                            status: safe_status(status),
+                        })
+                    }
                     Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
@@ -312,6 +357,147 @@ impl PrimeDaemon {
         self.stopped = true;
         outcome
     }
+
+    /// Shut down a poisoned session owner without letting an unadmitted or
+    /// malformed bootstrap exchange shorten its cleanup horizon. The caller
+    /// keeps the native-session obligation armed across every await.
+    pub(super) async fn shutdown_poisoned_in_place(
+        &mut self,
+        deadline: Instant,
+        poison_horizon: Duration,
+        fresh_bridge: bool,
+    ) {
+        let daemon_already_exited = matches!(self.daemon_exit_status(), Ok(Some(_)));
+        if self.admitted_clean_daemon_exit() {
+            self.finish_poison_shutdown();
+            return;
+        }
+
+        if fresh_bridge
+            && !daemon_already_exited
+            && let Ok(request_timeout) =
+                remaining(deadline, "poison daemon shutdown", poison_horizon)
+        {
+            let response = self
+                .bridge
+                .request(
+                    "poison daemon shutdown",
+                    json!({
+                        "op": "shutdown",
+                        "timeoutMs": duration_millis(request_timeout),
+                    }),
+                    request_timeout,
+                )
+                .await;
+            // Only the fixed shutdown response or resolved-request rejection
+            // proves shim-to-daemon admission. A thrown SDK request uses a
+            // different fixed error and remains unadmitted.
+            if shutdown_request_was_admitted(&response) {
+                self.shutdown_request_admitted = true;
+            }
+            if validate_shutdown(response).is_err() {
+                // The response is not authoritative cleanup proof and this
+                // serialized bridge is no longer reusable.
+                self.bridge.kill_now();
+            }
+        }
+
+        if self.daemon_exit_status.is_none() {
+            self.wait_for_daemon_exit_until(deadline, poison_horizon)
+                .await;
+        }
+        if self.admitted_clean_daemon_exit() {
+            self.finish_poison_shutdown();
+            return;
+        }
+
+        // An unadmitted request, nonzero exit, timeout, or process-status error
+        // is never allowed to shorten the shared horizon. If an exact exit was
+        // observed, its leader is already reaped while the logical cleanup
+        // obligation remains armed through this wait.
+        let grace = deadline.saturating_duration_since(Instant::now());
+        if !grace.is_zero() {
+            tokio::time::sleep(grace).await;
+        }
+
+        // Only the shared poison horizon may authorize forced termination.
+        // Force the exact captured child, then make one bounded reap attempt;
+        // OwnedChild's Drop remains the final non-cancellable wait backstop.
+        self.bridge.kill_now();
+        if self.daemon_exit_status.is_none() {
+            self.daemon.kill_now();
+            if let Ok(status) = self.daemon.wait(POISON_FORCE_REAP_TIMEOUT).await {
+                self.daemon_exit_status = Some(status);
+            }
+        }
+        self.finish_poison_shutdown();
+    }
+
+    pub(super) fn daemon_exit_status(
+        &mut self,
+    ) -> Result<Option<std::process::ExitStatus>, PrimeDaemonError> {
+        if let Some(status) = &self.daemon_exit_status {
+            return Ok(Some(*status));
+        }
+        let Some(status) = self.daemon.try_status()? else {
+            return Ok(None);
+        };
+        self.daemon_exit_status = Some(status);
+        Ok(Some(status))
+    }
+
+    pub(super) fn admitted_clean_daemon_exit(&self) -> bool {
+        admitted_successful_shutdown_exit(
+            self.shutdown_request_admitted,
+            self.daemon_exit_status.as_ref(),
+        )
+    }
+
+    async fn wait_for_daemon_exit_until(&mut self, deadline: Instant, poison_horizon: Duration) {
+        if let Ok(Some(_)) = self.daemon_exit_status() {
+            return;
+        }
+        let Ok(wait_timeout) = remaining(deadline, "poison daemon exit", poison_horizon) else {
+            return;
+        };
+        if let Ok(status) = self.daemon.wait(wait_timeout).await {
+            self.daemon_exit_status = Some(status);
+        }
+    }
+
+    fn finish_poison_shutdown(&mut self) {
+        self.bridge.kill_now();
+        self.paths.cleanup();
+        self.stopped = true;
+    }
+}
+
+fn validate_utf8_control_paths<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<(), PrimeDaemonError> {
+    if paths.into_iter().any(|path| path.to_str().is_none()) {
+        return Err(PrimeDaemonError::TransportSecurity {
+            reason: "private control paths must be valid UTF-8",
+        });
+    }
+    Ok(())
+}
+
+fn shutdown_request_was_admitted(
+    response: &Result<contract::BridgeResponse, PrimeDaemonError>,
+) -> bool {
+    match response {
+        Ok(contract::BridgeResponse::Shutdown { .. }) => true,
+        Ok(contract::BridgeResponse::Error { code, .. }) => code == "shutdown-response-rejected",
+        _ => false,
+    }
+}
+
+fn admitted_successful_shutdown_exit(
+    request_admitted: bool,
+    status: Option<&std::process::ExitStatus>,
+) -> bool {
+    request_admitted && status.is_some_and(std::process::ExitStatus::success)
 }
 
 impl Drop for PrimeDaemon {
@@ -552,6 +738,58 @@ fn safe_status(status: std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_control_paths_fail_before_private_json_serialization() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"private-\xff".to_vec()));
+        let error = validate_utf8_control_paths([path.as_path()])
+            .expect_err("non-UTF-8 control path was accepted");
+        assert!(matches!(
+            &error,
+            PrimeDaemonError::TransportSecurity {
+                reason: "private control paths must be valid UTF-8",
+            }
+        ));
+        assert!(!error.to_string().contains("private-"));
+    }
+
+    #[test]
+    fn shutdown_admission_requires_resolved_sdk_request_evidence() {
+        let acknowledged = Ok(contract::BridgeResponse::Shutdown {
+            v: contract::CONTROL_VERSION,
+            id: 1,
+            acknowledged: true,
+        });
+        let resolved_rejection = Ok(contract::BridgeResponse::Error {
+            v: contract::CONTROL_VERSION,
+            id: 1,
+            code: "shutdown-response-rejected".into(),
+        });
+        let thrown_request = Ok(contract::BridgeResponse::Error {
+            v: contract::CONTROL_VERSION,
+            id: 1,
+            code: "shutdown-not-acknowledged".into(),
+        });
+        assert!(shutdown_request_was_admitted(&acknowledged));
+        assert!(shutdown_request_was_admitted(&resolved_rejection));
+        assert!(!shutdown_request_was_admitted(&thrown_request));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poison_consumption_requires_admission_and_successful_exact_exit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let success = std::process::ExitStatus::from_raw(0);
+        let nonzero = std::process::ExitStatus::from_raw(7 << 8);
+        assert!(admitted_successful_shutdown_exit(true, Some(&success)));
+        assert!(!admitted_successful_shutdown_exit(false, Some(&success)));
+        assert!(!admitted_successful_shutdown_exit(true, Some(&nonzero)));
+        assert!(!admitted_successful_shutdown_exit(true, None));
+    }
 
     #[test]
     fn extreme_deadlines_fail_or_clamp_without_panicking() {

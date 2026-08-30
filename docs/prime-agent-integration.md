@@ -85,6 +85,24 @@ Only opaque host-resolvable resume tokens may enter durable Comet state. Absolut
 - Keep authentication in Prime Agent initially. Never copy `auth.json`, OAuth tokens, API keys, or provider diagnostics into synchronized state.
 - Unknown future events and capabilities must degrade locally without preventing safe session attachment.
 
+## Private native session owner
+
+The daemon foundation and the native session owner are separate trust boundaries. The foundation can start and stop a compatible stock Prime 0.8.1 daemon. Creating a native session additionally requires the reviewed fork contract. Before any create request, the host verifies all of these conditions:
+
+- the public package root exports a frozen `PRIME_AGENT_SDK_FEATURES` registry containing `bounded_daemon_ingress_v1`;
+- `DaemonClient` is constructed with a 64 MiB inbound-frame limit inside a Node process with a 512 MiB V8 heap limit; and
+- the daemon offers `client_owned_sessions`, `chunked_snapshot`, `immutable_snapshot_transfer_v1`, and `authoritative_owned_session_cleanup_v1`.
+
+The session owner creates one fresh `draft` session and attaches it immediately. It uses the public `DaemonAgentConnection` constructor followed by instance `attach()`. It does not use the static attach helper because attach-failure cleanup evidence must remain visible to the owner. Attaching arbitrary saved sessions is deferred until Comet has an explicit cumulative snapshot budget and an opaque durable resume mapping.
+
+The Rust-to-Node control channel is private and bounded. Raw frames are at most 16 KiB. Decimal request identifiers are 1–16 digits and are never reused. At most eight requests and 32 normalized events can be pending. Unknown, duplicate, mismatched, malformed, or oversized frames poison the channel. Only fixed error codes and bounded safe receipts can cross back to Rust.
+
+The session-host process receives a strict non-secret environment allowlist. Provider credentials stay in the daemon environment. Native session identifiers, active-session selectors, session files, daemon paths, sockets, process details, payloads, diagnostics, and raw SDK errors remain host-private. The public receipt exposes only bounded snapshot counts and boolean state. Any path that would enter private JSON must be canonical UTF-8; invalid input fails with a fixed code before the session host starts.
+
+A normal close succeeds only after direct owning `complete_owned_session` proof. If the owning host crashes, a fresh non-owner bootstrap connection must report authoritative cleanup as `settled`. A timeout, malformed response, unprovable process identity, or incomplete durable cleanup returns `cleanup-uncertain` and consumes the private daemon. A dedicated reaper runtime is started and readiness-proved before the session host, so cancellation and `Drop` only transfer the daemon, host, and cleanup obligation to an already-live bounded owner. They never mean that cleanup was aborted. Bootstrap channels are replaced after an interrupted or failed cleanup query before shutdown is attempted. A poisoned shutdown retains ownership through the cleanup horizon unless a resolved SDK shutdown request is followed by a successful exit of the exact supervisor generation. That exit is global drain evidence only: it can end daemon consumption early, but it never turns an uncertain session close into success.
+
+This slice is host-only. It does not add a `Harness`, registry entry, synchronized document, RPC, settings, model selector, or UI. Prompt submission, streaming normalization, steering, interruption, correlated settlement, reconnect and resume, subagents, resources, MCP, compaction, refinement, goals, automation, approvals, and ACP fallback remain later reviewed slices.
+
 ## Merge readiness
 
 A Prime integration change is ready only when:

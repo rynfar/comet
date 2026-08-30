@@ -91,8 +91,16 @@ impl PrimeServerCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum OwnedSessionCleanupStatus {
+    Active,
+    Stopping,
+    Settled,
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) enum BridgeResponse {
     #[serde(rename_all = "camelCase")]
     Loaded {
@@ -106,6 +114,12 @@ pub(super) enum BridgeResponse {
         id: u64,
         protocol_version: u64,
         capabilities: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    OwnedSessionCleanup {
+        v: u8,
+        id: u64,
+        status: OwnedSessionCleanupStatus,
     },
     Shutdown {
         v: u8,
@@ -124,6 +138,7 @@ impl BridgeResponse {
         let (version, id) = match self {
             Self::Loaded { v, id, .. }
             | Self::Ready { v, id, .. }
+            | Self::OwnedSessionCleanup { v, id, .. }
             | Self::Shutdown { v, id, .. }
             | Self::Error { v, id, .. } => (*v, *id),
         };
@@ -192,5 +207,40 @@ mod tests {
             code: "/private/path".into(),
         };
         assert!(response.validate_meta(1).is_err());
+    }
+
+    #[test]
+    fn cleanup_status_is_bounded_and_metadata_is_correlated() {
+        for (wire, expected) in [
+            ("active", OwnedSessionCleanupStatus::Active),
+            ("stopping", OwnedSessionCleanupStatus::Stopping),
+            ("settled", OwnedSessionCleanupStatus::Settled),
+        ] {
+            let bytes = format!(
+                r#"{{"v":{CONTROL_VERSION},"id":7,"kind":"owned-session-cleanup","status":"{wire}"}}"#
+            );
+            let response: BridgeResponse = serde_json::from_str(&bytes).unwrap();
+            assert!(response.validate_meta(7).is_ok());
+            assert!(matches!(
+                response,
+                BridgeResponse::OwnedSessionCleanup { status, .. } if status == expected
+            ));
+        }
+
+        let unknown = format!(
+            r#"{{"v":{CONTROL_VERSION},"id":7,"kind":"owned-session-cleanup","status":"/private/native-id"}}"#
+        );
+        assert!(serde_json::from_str::<BridgeResponse>(&unknown).is_err());
+        let injected = format!(
+            r#"{{"v":{CONTROL_VERSION},"id":7,"kind":"owned-session-cleanup","status":"settled","raw":"/private/native-id"}}"#
+        );
+        assert!(serde_json::from_str::<BridgeResponse>(&injected).is_err());
+
+        let response = BridgeResponse::OwnedSessionCleanup {
+            v: CONTROL_VERSION,
+            id: 7,
+            status: OwnedSessionCleanupStatus::Settled,
+        };
+        assert!(response.validate_meta(8).is_err());
     }
 }
