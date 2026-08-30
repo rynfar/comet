@@ -101,6 +101,7 @@ pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
+pub mod prime;
 pub mod shell_env;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
