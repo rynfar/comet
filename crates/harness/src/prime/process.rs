@@ -11,23 +11,25 @@ use super::contract::{BridgeResponse, MAX_FRAME_BYTES};
 use super::{PrimeDaemonError, PrimePackage, PrimePaths};
 
 const TERM_GRACE: Duration = Duration::from_millis(750);
-// The stock public DaemonClient reader has no line-size option yet
-// (pylon-code/prime-agent#13). Keep bootstrap ingress in a small isolated heap
-// plus Rust's operation deadline; the long-lived session host remains blocked
-// on a true SDK ingress bound.
+// The stock public DaemonClient reader has no line-size option. Keep bootstrap
+// ingress in a small isolated heap plus Rust's operation deadline. The
+// long-lived session layer separately requires the reviewed bounded-ingress SDK
+// contract merged through pylon-code/prime-agent#13.
 const BRIDGE_HEAP_MIB: &str = "64";
+pub(super) const SESSION_HOST_HEAP_MIB: &str = "512";
 
 pub(super) type ProcessEnvironment = BTreeMap<OsString, OsString>;
 
 pub(super) struct ProcessEnvironments {
     pub bridge: ProcessEnvironment,
     pub daemon: ProcessEnvironment,
+    pub session_host: ProcessEnvironment,
 }
 
-/// Build separate bridge and daemon environments. The bootstrap bridge gets a
-/// fixed non-secret allowlist. The Prime daemon keeps public provider and
-/// extension configuration, while recursion state and process-loader injection
-/// are removed before it becomes a top-level runtime.
+/// Build separate bootstrap, session-host, and daemon environments. Both SDK
+/// clients get the same fixed non-secret allowlist. The Prime daemon keeps
+/// public provider and extension configuration, while recursion state and
+/// process-loader injection are removed before it becomes a top-level runtime.
 pub(super) fn make_process_environments(
     source: Option<ProcessEnvironment>,
     package: &PrimePackage,
@@ -35,10 +37,12 @@ pub(super) fn make_process_environments(
     let source = source.unwrap_or_else(|| std::env::vars_os().collect());
     let mut bridge = ProcessEnvironment::new();
     let mut daemon = ProcessEnvironment::new();
+    let mut session_host = ProcessEnvironment::new();
     for (name, value) in source {
         let text = name.to_string_lossy();
         if bridge_environment_name(&text) {
             bridge.insert(name.clone(), value.clone());
+            session_host.insert(name.clone(), value.clone());
         }
         if daemon_environment_name(&text) {
             daemon.insert(name, value);
@@ -46,7 +50,12 @@ pub(super) fn make_process_environments(
     }
     compose_runtime_path(&mut bridge, package);
     compose_runtime_path(&mut daemon, package);
-    ProcessEnvironments { bridge, daemon }
+    compose_runtime_path(&mut session_host, package);
+    ProcessEnvironments {
+        bridge,
+        daemon,
+        session_host,
+    }
 }
 
 fn bridge_environment_name(name: &str) -> bool {
@@ -157,10 +166,15 @@ impl OwnedChild {
     }
 
     pub fn try_status(&mut self) -> Result<Option<ExitStatus>, PrimeDaemonError> {
+        let status_stage = if self.process == "session host" {
+            "session host process status"
+        } else {
+            "process status"
+        };
         let status = self
             .child_mut()?
             .try_wait()
-            .map_err(|error| PrimeDaemonError::io("process status", &error))?;
+            .map_err(|error| PrimeDaemonError::io(status_stage, &error))?;
         if status.is_some() {
             self.reaped = true;
             self.kill_group_remainders();
@@ -175,10 +189,10 @@ impl OwnedChild {
             tokio::time::timeout(timeout, child.wait())
                 .await
                 .map_err(|_| PrimeDaemonError::Timeout {
-                    stage: if process == "daemon" {
-                        "daemon process wait"
-                    } else {
-                        "bridge process wait"
+                    stage: match process {
+                        "daemon" => "daemon process wait",
+                        "session host" => "session host process wait",
+                        _ => "bridge process wait",
                     },
                     timeout,
                 })?
@@ -191,7 +205,14 @@ impl OwnedChild {
                 self.kill_group_remainders();
                 Ok(status)
             }
-            Err(error) => Err(PrimeDaemonError::io("process wait", &error)),
+            Err(error) => Err(PrimeDaemonError::io(
+                if self.process == "session host" {
+                    "session host process wait"
+                } else {
+                    "process wait"
+                },
+                &error,
+            )),
         }
     }
 
@@ -256,6 +277,58 @@ impl Drop for OwnedChild {
             let _ = child.start_kill();
         }
     }
+}
+
+/// Owned long-lived SDK host transport. Session protocol code owns the pipes
+/// and must preserve the `OwnedChild` until all host and native-session cleanup
+/// obligations have settled.
+pub(super) struct SessionHostProcess {
+    pub(super) process: OwnedChild,
+    pub(super) stdin: ChildStdin,
+    pub(super) stdout: ChildStdout,
+}
+
+pub(super) fn spawn_session_host(
+    package: &PrimePackage,
+    paths: &PrimePaths,
+    environment: &ProcessEnvironment,
+) -> Result<SessionHostProcess, PrimeDaemonError> {
+    // Use only the validated canonical Node executable and the Comet-owned
+    // private shim. The heap limit is an explicit CLI flag rather than an
+    // injectable NODE_OPTIONS value.
+    let mut command = Command::new(&package.node);
+    command
+        .arg(format!("--max-old-space-size={SESSION_HOST_HEAP_MIB}"))
+        .arg(&paths.session_shim)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // SDK/provider diagnostics can include credentials, paths, native
+        // identifiers, and payloads. They must never enter a Comet error.
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| PrimeDaemonError::io("session host spawn", &error))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or(PrimeDaemonError::InvalidSessionHostFrame {
+            reason: "control input was not created",
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(PrimeDaemonError::InvalidSessionHostFrame {
+            reason: "control output was not created",
+        })?;
+    Ok(SessionHostProcess {
+        process: OwnedChild::from_child(child, "session host"),
+        stdin,
+        stdout,
+    })
 }
 
 /// Bootstrap-only SDK control process.
@@ -486,40 +559,171 @@ const fn libc_signal_kill() -> i32 {
 mod tests {
     use super::*;
 
+    fn test_package(node: impl Into<std::path::PathBuf>) -> PrimePackage {
+        PrimePackage {
+            executable: "/private/package/bin/prime-agent".into(),
+            public_entry: "/private/package/index.js".into(),
+            version: "test".into(),
+            node: node.into(),
+        }
+    }
+
     #[test]
-    fn child_environments_isolate_the_bridge_without_breaking_provider_configuration() {
-        for bridge_secret in [
+    fn child_environments_isolate_sdk_hosts_without_breaking_daemon_configuration() {
+        let package = test_package("/canonical/node/bin/node");
+        let mut source = ProcessEnvironment::new();
+        for (name, value) in [
+            ("HOME", "/private/home"),
+            ("PATH", "/source/bin"),
+            ("TMPDIR", "/private/tmp"),
+            ("LANG", "C.UTF-8"),
+            ("LC_CTYPE", "C.UTF-8"),
+            ("ANTHROPIC_API_KEY", "provider-secret"),
+            ("AWS_SECRET_ACCESS_KEY", "provider-secret"),
+            ("ACME_CUSTOM_PROVIDER_TOKEN", "provider-secret"),
+            ("PRIME_AGENT_INTERNAL_SECRET", "internal"),
+            ("PRIME_AGENT_INTERNAL_NODE_OPTIONS", "internal"),
+            ("RLM_DEPTH", "9"),
+            ("NODE_OPTIONS", "--require=/private/inject.cjs"),
+            ("NODE_PATH", "/private/modules"),
+            ("LD_PRELOAD", "/private/inject.so"),
+            ("LD_LIBRARY_PATH", "/private/lib"),
+            ("DYLD_INSERT_LIBRARIES", "/private/inject.dylib"),
+        ] {
+            source.insert(name.into(), value.into());
+        }
+
+        let environments = make_process_environments(Some(source), &package);
+        for name in [
             "ANTHROPIC_API_KEY",
             "AWS_SECRET_ACCESS_KEY",
             "ACME_CUSTOM_PROVIDER_TOKEN",
-        ] {
-            assert!(
-                !bridge_environment_name(bridge_secret),
-                "bridge kept {bridge_secret}"
-            );
-            assert!(
-                daemon_environment_name(bridge_secret),
-                "daemon dropped {bridge_secret}"
-            );
-        }
-        for rejected in [
-            "RLM_DEPTH",
             "PRIME_AGENT_INTERNAL_SECRET",
+            "PRIME_AGENT_INTERNAL_NODE_OPTIONS",
+            "RLM_DEPTH",
             "NODE_OPTIONS",
             "NODE_PATH",
             "LD_PRELOAD",
             "LD_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES",
         ] {
-            assert!(!daemon_environment_name(rejected), "daemon kept {rejected}");
+            assert!(
+                !environments.session_host.contains_key(OsStr::new(name)),
+                "session host kept {name}"
+            );
         }
-        for shared in ["HOME", "PATH", "TMPDIR", "LANG", "LC_CTYPE"] {
-            assert!(bridge_environment_name(shared), "bridge dropped {shared}");
-            assert!(daemon_environment_name(shared), "daemon dropped {shared}");
+        for name in ["HOME", "PATH", "TMPDIR", "LANG", "LC_CTYPE"] {
+            assert!(
+                environments.session_host.contains_key(OsStr::new(name)),
+                "session host dropped {name}"
+            );
         }
+        let host_path = environments
+            .session_host
+            .get(OsStr::new("PATH"))
+            .expect("session host has a canonical runtime PATH");
+        assert_eq!(
+            std::env::split_paths(host_path).next().as_deref(),
+            Some(std::path::Path::new("/canonical/node/bin"))
+        );
+
+        // The daemon keeps provider configuration and retains its foundation
+        // filtering behavior unchanged.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "ACME_CUSTOM_PROVIDER_TOKEN",
+        ] {
+            assert!(
+                environments.daemon.contains_key(OsStr::new(name)),
+                "daemon dropped {name}"
+            );
+        }
+        for name in [
+            "RLM_DEPTH",
+            "PRIME_AGENT_INTERNAL_SECRET",
+            "PRIME_AGENT_INTERNAL_NODE_OPTIONS",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
+            assert!(
+                !environments.daemon.contains_key(OsStr::new(name)),
+                "daemon kept {name}"
+            );
+        }
+        assert!(!bridge_environment_name("PRIME_AGENT_INTERNAL_ANYTHING"));
         assert!(!bridge_environment_name("RLM_MAX_DEPTH"));
         assert!(daemon_environment_name("RLM_MAX_DEPTH"));
         assert!(daemon_environment_name("PRIME_AGENT_CODING_AGENT_DIR"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn session_host_uses_private_shim_explicit_heap_and_isolated_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+
+        let state = tempfile::tempdir().unwrap();
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let fake_node = tools.path().join("node");
+        std::fs::write(
+            &fake_node,
+            r#"#!/bin/sh
+printf '%s\n' "$1"
+printf '%s\n' "$2"
+printf 'node-options=%s\n' "${NODE_OPTIONS-unset}"
+printf 'node-path=%s\n' "${NODE_PATH-unset}"
+printf 'provider-secret=%s\n' "${ANTHROPIC_API_KEY-unset}"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let package = test_package(std::fs::canonicalize(&fake_node).unwrap());
+        let paths = PrimePaths::prepare(
+            &std::fs::canonicalize(state.path()).unwrap(),
+            "session-host-process-test",
+            &std::fs::canonicalize(sockets.path()).unwrap(),
+        )
+        .unwrap();
+        let source = [
+            (OsString::from("PATH"), OsString::from("/source/bin")),
+            (
+                OsString::from("NODE_OPTIONS"),
+                OsString::from("--require=/private/inject.cjs"),
+            ),
+            (
+                OsString::from("NODE_PATH"),
+                OsString::from("/private/modules"),
+            ),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("provider-secret"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let environments = make_process_environments(Some(source), &package);
+
+        let mut host = spawn_session_host(&package, &paths, &environments.session_host).unwrap();
+        let mut output = String::new();
+        host.stdout.read_to_string(&mut output).await.unwrap();
+        let status = host.process.wait(Duration::from_secs(2)).await.unwrap();
+        assert!(status.success());
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "--max-old-space-size=512",
+                paths.session_shim.to_string_lossy().as_ref(),
+                "node-options=unset",
+                "node-path=unset",
+                "provider-secret=unset",
+            ]
+        );
     }
 
     #[tokio::test]

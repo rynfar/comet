@@ -11,6 +11,7 @@ const CONTROL_VERSION = 1;
 const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_CAPABILITIES = 128;
 const MAX_CAPABILITY_BYTES = 128;
+const MAX_PRIVATE_ID_BYTES = 256;
 const PROTOCOL_NAME = "prime-agent.daemon";
 const MIN_PROTOCOL_VERSION = 7;
 const RETRY_MS = 40;
@@ -167,6 +168,54 @@ async function connect(frame) {
   });
 }
 
+function validPrivateId(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    Buffer.byteLength(value) <= MAX_PRIVATE_ID_BYTES &&
+    !/[\u0000-\u0020\u007f]/u.test(value)
+  );
+}
+
+async function cleanupStatus(frame) {
+  if (
+    !client ||
+    !validPrivateId(frame.activeSessionId) ||
+    !Number.isSafeInteger(frame.timeoutMs) ||
+    frame.timeoutMs <= 0
+  ) {
+    fail(frame.id, "invalid-cleanup-status-request");
+    return;
+  }
+
+  let response;
+  try {
+    response = await client.request(
+      { type: "get_owned_session_cleanup", activeSessionId: frame.activeSessionId },
+      frame.timeoutMs,
+    );
+  } catch {
+    fail(frame.id, "cleanup-status-failed");
+    return;
+  }
+  const status = response?.data?.status;
+  if (
+    response?.type !== "response" ||
+    response?.command !== "get_owned_session_cleanup" ||
+    response?.success !== true ||
+    !["active", "stopping", "settled"].includes(status)
+  ) {
+    fail(frame.id, "cleanup-status-failed");
+    return;
+  }
+  respond({
+    v: CONTROL_VERSION,
+    id: frame.id,
+    kind: "owned-session-cleanup",
+    status,
+  });
+}
+
 async function shutdown(frame) {
   if (!client || !Number.isSafeInteger(frame.timeoutMs) || frame.timeoutMs <= 0) {
     fail(frame.id, "invalid-shutdown-request");
@@ -209,6 +258,9 @@ async function handle(line) {
       break;
     case "connect":
       await connect(frame);
+      break;
+    case "cleanup-status":
+      await cleanupStatus(frame);
       break;
     case "shutdown":
       await shutdown(frame);

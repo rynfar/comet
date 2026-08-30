@@ -4,26 +4,23 @@
 //! - [`package`] proves the configured executable belongs to the installed
 //!   package and resolves only its public root ESM export.
 //! - [`paths`] creates private host-only transport and session paths.
-//! - [`process`] owns bounded process groups and a bootstrap-only JSONL client.
-//!
-//! Session events must not reuse the bootstrap client's request/next-line
-//! shape. The next session issue must define an asynchronous SDK host that
-//! demultiplexes response IDs and normalized unsolicited events.
-//!
-//! Stock Prime may launch resident session workers as detached processes. The
-//! Unix groups here strictly own the bootstrap and daemon leaders plus ordinary
-//! descendants, but they are not proof of worker settlement. Before sessions
-//! ship, authoritative daemon shutdown and worker/descriptor reconciliation
-//! must have separate contract tests.
+//! - [`process`] owns bounded process groups and isolated SDK hosts.
 //! - [`contract`] validates the stock daemon baseline and optional offers.
+//! - [`session`] owns one capability-gated client-owned session, asynchronously
+//!   demultiplexes its bounded private control protocol, and exposes only fixed
+//!   normalized events and safe snapshot receipts.
 //!
-//! This slice starts no agent session and publishes no synchronized state.
+//! Stock Prime may launch resident session workers as detached processes. A
+//! process-group exit is never treated as worker settlement. Session close and
+//! crash recovery require the fork's authoritative owning-cleanup proof before
+//! daemon ownership can be returned.
 
 mod contract;
 mod error;
 mod package;
 mod paths;
 mod process;
+mod session;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -39,8 +36,12 @@ pub use error::PrimeDaemonError;
 use package::PrimePackage;
 use paths::PrimePaths;
 use process::{BootstrapBridge, OwnedChild, ProcessEnvironment};
+pub use session::{
+    PrimeSessionConfig, PrimeSessionEvent, PrimeSessionLease, PrimeSessionSnapshotReceipt,
+};
 
 const SHIM_SOURCE: &str = include_str!("shim.mjs");
+const SESSION_HOST_SOURCE: &str = include_str!("session/host.mjs");
 
 /// Local-only configuration. Native identifiers and paths stay inside the
 /// harness process and must never be copied into Comet documents or RPC data.
@@ -125,6 +126,8 @@ pub struct PrimeDaemon {
     bridge: BootstrapBridge,
     daemon: OwnedChild,
     paths: PrimePaths,
+    package: PrimePackage,
+    session_host_environment: ProcessEnvironment,
     shutdown_timeout: Duration,
     stopped: bool,
 }
@@ -164,6 +167,10 @@ impl PrimeDaemon {
             let paths =
                 PrimePaths::prepare(&config.state_dir, &config.instance_id, &config.socket_root)?;
             if let Err(error) = paths::write_shim(&paths.shim, SHIM_SOURCE) {
+                paths.cleanup();
+                return Err(error);
+            }
+            if let Err(error) = paths::write_shim(&paths.session_shim, SESSION_HOST_SOURCE) {
                 paths.cleanup();
                 return Err(error);
             }
@@ -255,6 +262,8 @@ impl PrimeDaemon {
                 bridge,
                 daemon,
                 paths,
+                package,
+                session_host_environment: environments.session_host,
                 shutdown_timeout: config.shutdown_timeout,
                 stopped: false,
             })
@@ -272,6 +281,13 @@ impl PrimeDaemon {
     /// transfers child handles to their reapers instead of leaving a poisoned
     /// bootstrap request channel available for reuse.
     pub async fn shutdown(mut self) -> Result<(), PrimeDaemonError> {
+        self.shutdown_in_place().await
+    }
+
+    /// Session cleanup owners call this without moving the daemon out of their
+    /// armed RAII guard. Cancellation therefore leaves Drop able to resume the
+    /// exact cleanup obligation instead of immediately killing the supervisor.
+    pub(super) async fn shutdown_in_place(&mut self) -> Result<(), PrimeDaemonError> {
         let deadline = checked_deadline(self.shutdown_timeout, "daemon shutdown")?;
         let request_timeout = remaining(deadline, "daemon shutdown", self.shutdown_timeout)?;
         let response = self
