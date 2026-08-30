@@ -986,7 +986,6 @@ let nextClient = 0;
 let owned;
 let shuttingDown = false;
 let shutdownFlight;
-let shutdownFinalizeTimer;
 let shutdownFinalized = false;
 const sockets = new Set();
 const reverseResponses = [];
@@ -1075,7 +1074,18 @@ function workerExited(session) {
 async function cleanupOwned(reason, force = false) {
   const session = owned;
   if (!session || session.status === "settled") return;
-  if (session.cleanup && !force) return await session.cleanup;
+  // Exact Prime 7238 semantics join one registered stop operation. A later
+  // force request cannot bypass an in-flight graceful stop.
+  if (session.cleanup) {
+    record({
+      kind:"cleanup_join",
+      reason,
+      force,
+      status:session.status,
+      activeSessionId:session.activeSessionId,
+    });
+    return await session.cleanup;
+  }
   const cleanup = (async () => {
     if (session.status === "active") {
       record({kind:"cleanup_state", status:"active", reason, activeSessionId:session.activeSessionId});
@@ -1239,18 +1249,10 @@ async function cleanupStatus(request, socket, client) {
 function finalizeShutdown() {
   if (shutdownFinalized) return;
   shutdownFinalized = true;
-  if (shutdownFinalizeTimer) clearTimeout(shutdownFinalizeTimer);
   try { server.close(); } catch {}
   for (const peer of sockets) peer.destroy();
   try { fs.rmSync(socketPath, {force:true}); } catch {}
   process.exit(0);
-}
-
-function scheduleShutdownFinalizer() {
-  if (shutdownFinalized || shutdownFinalizeTimer) return;
-  // Response callbacks finish normal/live requests immediately. This finite
-  // fallback owns completion when the initiating channel was cancelled.
-  shutdownFinalizeTimer = setTimeout(finalizeShutdown, 200);
 }
 
 async function runShutdownFlight(firstClientId) {
@@ -1264,24 +1266,36 @@ async function runShutdownFlight(firstClientId) {
   });
 }
 
-async function shutdown(request, socket, client) {
-  if (!shutdownFlight) {
-    shuttingDown = true;
-    shutdownFlight = runShutdownFlight(client.id);
-  } else {
-    record({kind:"daemon_shutdown_join", clientId:client.id});
+function startOrJoinShutdown(clientId) {
+  if (shutdownFlight) {
+    record({kind:"daemon_shutdown_join", clientId});
+    return;
   }
-  await shutdownFlight;
-  if (!socket.destroyed) {
-    try {
-      socket.write(
-        `${JSON.stringify(responseFor(request, {command:"shutdown", success:true}))}\n`,
-        () => finalizeShutdown(),
-      );
-      record({kind:"daemon_shutdown_response", clientId:client.id});
-    } catch {}
-  }
-  scheduleShutdownFinalizer();
+  shuttingDown = true;
+  shutdownFlight = runShutdownFlight(clientId);
+  void shutdownFlight.then(finalizeShutdown, (error) => {
+    record({kind:"daemon_shutdown_error", error:String(error)});
+    finalizeShutdown();
+  });
+}
+
+function shutdown(request, socket, client) {
+  const responseMode = readControl().shutdownResponse ?? "success";
+  const response = responseMode === "wrong-command"
+    ? responseFor(request, {command:"create", success:true})
+    : responseMode === "failure"
+      ? responseFor(request, {command:"shutdown", success:false, error:RAW_ERROR})
+      : responseFor(request, {command:"shutdown", success:true});
+  // Prime responds to each request before its setImmediate callback starts or
+  // joins the one channel-independent shutdown flight.
+  send(socket, response);
+  record({
+    kind:"daemon_shutdown_response",
+    clientId:client.id,
+    responseMode,
+    authoritative:responseMode === "success",
+  });
+  setImmediate(() => startOrJoinShutdown(client.id));
 }
 
 async function handle(request, socket, client) {

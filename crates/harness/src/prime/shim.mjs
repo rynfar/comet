@@ -221,9 +221,11 @@ async function shutdown(frame) {
     fail(frame.id, "invalid-shutdown-request");
     return;
   }
+  let admitted = false;
   let acknowledged = false;
   try {
     const response = await client.request({ type: "shutdown" }, frame.timeoutMs);
+    admitted = true;
     acknowledged =
       response?.type === "response" &&
       response?.command === "shutdown" &&
@@ -234,7 +236,10 @@ async function shutdown(frame) {
   } catch {}
   client = undefined;
   if (!acknowledged) {
-    fail(frame.id, "shutdown-not-acknowledged");
+    fail(
+      frame.id,
+      admitted ? "shutdown-response-rejected" : "shutdown-not-acknowledged",
+    );
     return;
   }
   respond({ v: CONTROL_VERSION, id: frame.id, kind: "shutdown", acknowledged: true });

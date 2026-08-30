@@ -4,6 +4,7 @@ mod contract;
 mod host;
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -26,6 +27,7 @@ const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(45);
 const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CLEANUP_REQUEST_SLICE: Duration = Duration::from_secs(2);
 const MIN_REAP_SLICE: Duration = Duration::from_millis(1);
+const REAPER_START_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 const REQUIRED_SESSION_CAPABILITIES: &[&str] = &[
@@ -58,12 +60,25 @@ struct SessionDeadlines {
 impl PrimeSessionConfig {
     /// Validate and retain an existing canonical working directory.
     pub fn new(cwd: impl AsRef<Path>) -> Result<Self, PrimeDaemonError> {
-        let cwd = std::fs::canonicalize(cwd.as_ref())
+        let cwd = cwd.as_ref();
+        if cwd.to_str().is_none() {
+            return Err(PrimeDaemonError::Session {
+                stage: "session configuration",
+                code: "path-is-not-utf8",
+            });
+        }
+        let cwd = std::fs::canonicalize(cwd)
             .map_err(|error| PrimeDaemonError::io("session working directory", &error))?;
         if !cwd.is_dir() {
             return Err(PrimeDaemonError::Session {
                 stage: "session configuration",
                 code: "working-directory-is-not-a-directory",
+            });
+        }
+        if cwd.to_str().is_none() {
+            return Err(PrimeDaemonError::Session {
+                stage: "session configuration",
+                code: "path-is-not-utf8",
             });
         }
         Ok(Self {
@@ -108,6 +123,12 @@ impl PrimeSessionConfig {
             return Err(PrimeDaemonError::Session {
                 stage: "session configuration",
                 code: "working-directory-changed",
+            });
+        }
+        if current.to_str().is_none() {
+            return Err(PrimeDaemonError::Session {
+                stage: "session configuration",
+                code: "path-is-not-utf8",
             });
         }
         for (stage, timeout) in [
@@ -178,6 +199,7 @@ pub enum PrimeSessionEvent {
 pub struct PrimeSessionLease {
     daemon: Option<PrimeDaemon>,
     host: Option<SessionHost>,
+    reaper: Option<SessionReaper>,
     cleanup_obligation: CleanupObligation,
     initial_snapshot: Option<PrimeSessionSnapshotReceipt>,
     deadlines: SessionDeadlines,
@@ -191,6 +213,119 @@ enum CleanupObligation {
     Known(ActiveSessionId),
 }
 
+type ReaperWork = (
+    PrimeDaemon,
+    Option<SessionHost>,
+    CleanupObligation,
+    SessionDeadlines,
+);
+
+/// A live, single-use submission handle for the lease's prestarted reaper.
+/// Readiness is acknowledged only after the dedicated Tokio runtime exists.
+struct SessionReaper {
+    sender: SyncSender<ReaperWork>,
+}
+
+enum ReaperReadiness {
+    Ready,
+    RuntimeFailed(std::io::ErrorKind),
+}
+
+impl SessionReaper {
+    fn start() -> Result<Self, PrimeDaemonError> {
+        Self::start_with_runtime_factory(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        })
+    }
+
+    fn start_with_runtime_factory<F>(runtime_factory: F) -> Result<Self, PrimeDaemonError>
+    where
+        F: FnOnce() -> std::io::Result<tokio::runtime::Runtime> + Send + 'static,
+    {
+        let (work_sender, work_receiver) = mpsc::sync_channel(1);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        let thread = std::thread::Builder::new()
+            .name("prime-session-reaper".into())
+            .spawn(move || {
+                let runtime = match runtime_factory() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_sender.send(ReaperReadiness::RuntimeFailed(error.kind()));
+                        return;
+                    }
+                };
+                if ready_sender.send(ReaperReadiness::Ready).is_err() {
+                    return;
+                }
+                let Ok((daemon, host, cleanup_obligation, deadlines)) = work_receiver.recv() else {
+                    return;
+                };
+                runtime.block_on(reap_dropped_lease(
+                    daemon,
+                    host,
+                    cleanup_obligation,
+                    deadlines,
+                ));
+            })
+            .map_err(|error| PrimeDaemonError::io("session reaper startup", &error))?;
+
+        match ready_receiver.recv_timeout(REAPER_START_TIMEOUT) {
+            Ok(ReaperReadiness::Ready) => Ok(Self {
+                sender: work_sender,
+            }),
+            Ok(ReaperReadiness::RuntimeFailed(kind)) => {
+                // The failed factory returns immediately after this rendezvous,
+                // so join it before reporting the sanitized startup failure.
+                let _ = thread.join();
+                Err(PrimeDaemonError::Io {
+                    stage: "session reaper startup",
+                    kind,
+                })
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(PrimeDaemonError::Timeout {
+                stage: "session reaper startup",
+                timeout: REAPER_START_TIMEOUT,
+            }),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = thread.join();
+                Err(PrimeDaemonError::Session {
+                    stage: "session reaper startup",
+                    code: "startup-channel-closed",
+                })
+            }
+        }
+    }
+
+    fn submit(self, work: ReaperWork) {
+        if let Err(error) = self.sender.send(work) {
+            // Readiness proves the receiver and runtime existed. If that
+            // invariant is ever violated, retain every opaque process handle
+            // rather than running their early-kill Drops on this caller.
+            std::mem::forget(error.0);
+        }
+    }
+}
+
+fn validate_session_json_paths(
+    daemon: &PrimeDaemon,
+    config: &PrimeSessionConfig,
+) -> Result<(), PrimeDaemonError> {
+    super::validate_utf8_control_paths([
+        daemon.package.public_entry.as_path(),
+        daemon.paths.socket.as_path(),
+        daemon.paths.session_dir.as_path(),
+    ])?;
+    if config.cwd.to_str().is_none() {
+        return Err(PrimeDaemonError::Session {
+            stage: "session configuration",
+            code: "path-is-not-utf8",
+        });
+    }
+    Ok(())
+}
+
 impl PrimeDaemon {
     /// Create, own, attach, and snapshot exactly one native session.
     ///
@@ -202,11 +337,24 @@ impl PrimeDaemon {
         config: PrimeSessionConfig,
     ) -> Result<PrimeSessionLease, PrimeDaemonError> {
         config.validate()?;
+        validate_session_json_paths(&self, &config)?;
 
+        // The reaper must be live before a host can start or any future can be
+        // cancelled. Startup failure is therefore still sessionless and may use
+        // the daemon's normal bounded shutdown path.
+        let reaper = match SessionReaper::start() {
+            Ok(reaper) => reaper,
+            Err(error) => {
+                let mut daemon = self;
+                shutdown_after_cleanup(&mut daemon).await;
+                return Err(error);
+            }
+        };
         let host =
             match SessionHost::spawn(&self.package, &self.paths, &self.session_host_environment) {
                 Ok(host) => host,
                 Err(error) => {
+                    drop(reaper);
                     let mut daemon = self;
                     shutdown_after_cleanup(&mut daemon).await;
                     return Err(error);
@@ -215,10 +363,11 @@ impl PrimeDaemon {
 
         // Install the cancellation-safe owner before the first asynchronous
         // host stage. From here on, cancellation always transfers daemon, host,
-        // and cleanup obligation to a bounded reaper.
+        // and cleanup obligation to the already-live bounded reaper.
         let mut opening = PrimeSessionLease {
             daemon: Some(self),
             host: Some(host),
+            reaper: Some(reaper),
             cleanup_obligation: CleanupObligation::None,
             initial_snapshot: None,
             deadlines: config.deadlines,
@@ -403,7 +552,16 @@ impl PrimeSessionLease {
             CleanupObligation::Known(active_session) => active_session,
             _ => panic!("a post-create owner has an exact cleanup obligation"),
         };
-        prove_cleanup(
+        if !matches!(
+            self.daemon
+                .as_mut()
+                .expect("an armed cleanup owner has its daemon")
+                .daemon_exit_status(),
+            Ok(None)
+        ) {
+            return false;
+        }
+        if !prove_cleanup(
             self.daemon
                 .as_mut()
                 .expect("an armed cleanup owner has its daemon"),
@@ -414,6 +572,16 @@ impl PrimeSessionLease {
             self.deadlines,
         )
         .await
+        {
+            return false;
+        }
+        matches!(
+            self.daemon
+                .as_mut()
+                .expect("an armed cleanup owner has its daemon")
+                .daemon_exit_status(),
+            Ok(None)
+        )
     }
 
     async fn abort_uncommitted(mut self, opening_error: PrimeDaemonError) -> PrimeDaemonError {
@@ -479,72 +647,22 @@ impl Drop for PrimeSessionLease {
             return;
         };
         let host = self.host.take();
+        let reaper = self.reaper.take();
         let cleanup_obligation =
             std::mem::replace(&mut self.cleanup_obligation, CleanupObligation::None);
         let deadlines = self.deadlines;
         self.initial_snapshot.take();
+        let work = (daemon, host, cleanup_obligation, deadlines);
 
-        // Never bind authoritative cleanup to the caller's Tokio runtime. That
-        // runtime may shut down immediately after cancelling the lease future,
-        // but the native worker obligation must remain owned through its full
-        // bounded cleanup horizon.
-        let work = std::sync::Arc::new(std::sync::Mutex::new(Some((
-            daemon,
-            host,
-            cleanup_obligation,
-            deadlines,
-        ))));
-        let thread_work = std::sync::Arc::clone(&work);
-        let spawned = std::thread::Builder::new()
-            .name("prime-session-reaper".into())
-            .spawn(move || {
-                let Some((daemon, host, cleanup_obligation, deadlines)) = thread_work
-                    .lock()
-                    .expect("session reaper mutex poisoned")
-                    .take()
-                else {
-                    return;
-                };
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(reap_dropped_lease(
-                        daemon,
-                        host,
-                        cleanup_obligation,
-                        deadlines,
-                    )),
-                    Err(_) => {
-                        // Runtime construction failure still drops both exact
-                        // group owners on this dedicated thread.
-                        drop(host);
-                        drop(daemon);
-                    }
-                }
-            });
-        if spawned.is_err()
-            && let Some((daemon, host, cleanup_obligation, deadlines)) =
-                work.lock().expect("session reaper mutex poisoned").take()
-        {
-            // OS thread creation is fallible. As the last fallback, run the
-            // same bounded reaper on a temporary local runtime rather than
-            // degrading to visible-group kills only.
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime.block_on(reap_dropped_lease(
-                    daemon,
-                    host,
-                    cleanup_obligation,
-                    deadlines,
-                )),
-                Err(_) => {
-                    drop(host);
-                    drop(daemon);
-                }
-            }
+        // Never bind cleanup to the caller's runtime or attempt fallible thread
+        // startup during Drop. The service acknowledged its dedicated runtime
+        // before any session operation was allowed to start.
+        if let Some(reaper) = reaper {
+            reaper.submit(work);
+        } else {
+            // An armed lease must always own its prestarted submission handle.
+            // Retain opaque process ownership if that invariant is violated.
+            std::mem::forget(work);
         }
     }
 }
@@ -562,14 +680,43 @@ async fn reap_dropped_lease(
     if let Some(host) = host.as_mut() {
         host.terminate().await;
     }
+    match daemon_has_exited(&mut daemon) {
+        Ok(Some(_)) if daemon.admitted_clean_daemon_exit() => {
+            // Shutdown request admission was persisted before cancellation and
+            // this exact successful leader exit has now been reaped. This permits a
+            // fast poison shutdown, but is not session-cleanup proof.
+            drop(host);
+            return;
+        }
+        Ok(Some(_)) => {
+            // A nonzero or unadmitted exit reaps the leader but keeps the
+            // logical obligation alive through the full poison horizon.
+            drop(host);
+            poison_shutdown(&mut daemon, deadlines.cleanup).await;
+            return;
+        }
+        Err(_) => {
+            // Process status is unprovable. Never authorize normal settlement
+            // or any clean return from that observation.
+            drop(host);
+            poison_shutdown(&mut daemon, deadlines.cleanup).await;
+            return;
+        }
+        Ok(None) => {}
+    }
+
     let _ = respawn_bootstrap(&mut daemon, deadlines.connect).await;
-    if daemon_has_exited(&mut daemon) {
-        // A shutdown accepted before cancellation can finish while its fresh
-        // nonowner bridge is connecting. Reap that exact supervisor generation
-        // now instead of retaining a zombie through later query deadlines. No
-        // cleanup proof is inferred.
-        drop(host);
-        return;
+    match daemon_has_exited(&mut daemon) {
+        Ok(Some(_)) if daemon.admitted_clean_daemon_exit() => {
+            drop(host);
+            return;
+        }
+        Ok(Some(_)) | Err(_) => {
+            drop(host);
+            poison_shutdown(&mut daemon, deadlines.cleanup).await;
+            return;
+        }
+        Ok(None) => {}
     }
 
     match cleanup_obligation {
@@ -648,8 +795,10 @@ fn poison_shutdown_timeout(configured_cleanup: Duration) -> Duration {
     configured_cleanup.max(DEFAULT_CLEANUP_TIMEOUT)
 }
 
-fn daemon_has_exited(daemon: &mut PrimeDaemon) -> bool {
-    matches!(daemon.daemon.try_status(), Ok(Some(_)))
+fn daemon_has_exited(
+    daemon: &mut PrimeDaemon,
+) -> Result<Option<std::process::ExitStatus>, PrimeDaemonError> {
+    daemon.daemon_exit_status()
 }
 
 async fn poison_shutdown(daemon: &mut PrimeDaemon, configured_cleanup: Duration) {
@@ -657,33 +806,39 @@ async fn poison_shutdown(daemon: &mut PrimeDaemon, configured_cleanup: Duration)
     // serialized SDK client behind the bootstrap bridge. Never enqueue daemon
     // shutdown behind that uncertain request. Kill the bridge group and prove
     // a fresh allowlisted nonowner connection first. Callers retain their exact
-    // cleanup obligation across both awaits, so cancellation re-enters Drop's
-    // fresh-bootstrap reaper rather than disarming the native session.
+    // cleanup obligation across every await, so cancellation re-enters Drop's
+    // already-live fresh-bootstrap reaper rather than disarming the session.
     let poison_horizon = poison_shutdown_timeout(configured_cleanup);
     daemon.shutdown_timeout = daemon.shutdown_timeout.max(poison_horizon);
-    if daemon_has_exited(daemon) {
-        return;
-    }
-    if respawn_bootstrap(daemon, configured_cleanup).await.is_err() {
-        // The replacement may itself have an uncertain response in flight. Do
-        // not reuse it for shutdown and do not kill the supervisor before its
-        // owner-disconnect cleanup grace can finish. The caller's obligation
-        // stays armed throughout this bounded wait. Its eventual Drop is the
-        // process-group backstop, while cancellation retries through the
-        // fresh-bootstrap reaper.
-        daemon.bridge.kill_now();
-        let horizon_deadline = Instant::now() + poison_horizon;
-        if daemon.daemon.wait(poison_horizon).await.is_err() {
-            // An immediate wait error is not proof that the supervisor exited.
-            // Preserve the full grace horizon before the owning Drop backstop.
-            let grace = horizon_deadline.saturating_duration_since(Instant::now());
-            if !grace.is_zero() {
-                tokio::time::sleep(grace).await;
-            }
+    let deadline = match checked_deadline(poison_horizon, "poison daemon shutdown") {
+        Ok(deadline) => deadline,
+        Err(_) => {
+            // Session deadline validation makes this unreachable on supported
+            // platforms. If Instant still rejects it, retain ownership for the
+            // configured horizon before entering the force/reap path.
+            tokio::time::sleep(poison_horizon).await;
+            Instant::now()
         }
-        return;
+    };
+
+    let process_is_live = match daemon_has_exited(daemon) {
+        Ok(Some(_)) => false,
+        Ok(None) | Err(_) => true,
+    };
+    let fresh_bridge = if process_is_live {
+        respawn_bootstrap(daemon, configured_cleanup).await.is_ok()
+    } else {
+        false
+    };
+    if !fresh_bridge {
+        // A failed refresh may itself have an uncertain request in flight. Do
+        // not reuse it for shutdown; the explicit poison path still retains the
+        // daemon and obligation until the shared absolute deadline.
+        daemon.bridge.kill_now();
     }
-    let _ = daemon.shutdown_in_place().await;
+    daemon
+        .shutdown_poisoned_in_place(deadline, poison_horizon, fresh_bridge)
+        .await;
 }
 
 async fn prove_cleanup(
@@ -765,6 +920,25 @@ async fn poll_cleanup_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaper_runtime_start_failure_is_sanitized_and_joined() {
+        let result = SessionReaper::start_with_runtime_factory(|| {
+            Err(std::io::Error::other("private runtime detail"))
+        });
+        let error = match result {
+            Ok(_) => panic!("the injected runtime failure was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            PrimeDaemonError::Io {
+                stage: "session reaper startup",
+                kind: std::io::ErrorKind::Other,
+            }
+        ));
+        assert!(!error.to_string().contains("private runtime detail"));
+    }
 
     #[test]
     fn defaults_extend_cleanup_beyond_owner_grace() {

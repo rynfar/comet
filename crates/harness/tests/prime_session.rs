@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use support::prime_session_fixture::{
     ACTIVE_SESSION_SENTINEL, ENV_SENTINEL, PrimeSessionFixture, PrimeSessionFixtureBuilder,
     RAW_ERROR_SENTINEL, REQUIRED_SESSION_SERVER_OFFERS, SDK_FEATURE, SESSION_SERVER_CAPABILITIES,
-    wait_for_path_absent, wait_for_process_exit,
+    process_exists, wait_for_path_absent, wait_for_process_exit,
 };
 use zeron_harness::prime::{PrimeDaemon, PrimeDaemonError, PrimeSessionConfig, PrimeSessionEvent};
 
@@ -38,6 +38,39 @@ fn observation_index(observations: &[Value], kind: &str) -> usize {
         .unwrap_or_else(|| panic!("missing {kind} observation: {observations:?}"))
 }
 
+fn observation_field_count(
+    fixture: &PrimeSessionFixture,
+    kind: &str,
+    field: &str,
+    expected: &str,
+) -> usize {
+    fixture
+        .observations()
+        .into_iter()
+        .filter(|value| {
+            value.get("kind").and_then(Value::as_str) == Some(kind)
+                && value.get(field).and_then(Value::as_str) == Some(expected)
+        })
+        .count()
+}
+
+async fn wait_for_cleanup_status(fixture: &PrimeSessionFixture, status: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(value) = fixture
+                .observations()
+                .into_iter()
+                .find(|value| value["kind"] == "cleanup_status_query" && value["status"] == status)
+            {
+                return value;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("nonowner observed cleanup {status}"))
+}
+
 fn session_constructor_observations(fixture: &PrimeSessionFixture) -> Vec<Value> {
     fixture
         .observations()
@@ -58,6 +91,36 @@ fn assert_no_session_create(fixture: &PrimeSessionFixture) {
 fn assert_error_private(fixture: &PrimeSessionFixture, error: &PrimeDaemonError) {
     fixture.assert_private_rendering(&format!("{error:?}"));
     fixture.assert_private_rendering(&error.to_string());
+}
+
+#[test]
+fn non_utf8_working_directory_is_rejected_without_processes_or_path_rendering() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = PrimeSessionFixtureBuilder::default().build();
+    let invalid_cwd = fixture
+        .working_directory
+        .join(std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()));
+
+    let error = PrimeSessionConfig::new(&invalid_cwd)
+        .err()
+        .expect("non-UTF8 session paths fail before process ownership begins");
+    assert!(matches!(
+        &error,
+        PrimeDaemonError::Session {
+            stage: "session configuration",
+            code: "path-is-not-utf8",
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Prime Agent session session configuration failed (path-is-not-utf8)"
+    );
+    assert_eq!(
+        format!("{error:?}"),
+        "Session { stage: \"session configuration\", code: \"path-is-not-utf8\" }"
+    );
+    assert!(fixture.observations().is_empty());
 }
 
 #[tokio::test]
@@ -402,6 +465,218 @@ async fn host_crash_with_known_selector_polls_active_stopping_settled_as_nonowne
 }
 
 #[tokio::test]
+async fn host_death_during_registered_stop_is_joined_by_nonowner_without_second_cleanup() {
+    let fixture = PrimeSessionFixtureBuilder::default().build();
+    let daemon = start(&fixture).await;
+    let lease = daemon
+        .create_session(session_config(&fixture))
+        .await
+        .expect("session opens");
+    fixture.gate("cleanup-stopping");
+
+    let host_pid = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "public_module_import" && value["role"] == "session_host")
+        .and_then(|value| value["pid"].as_u64())
+        .unwrap() as u32;
+    let created = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "session_created")
+        .unwrap();
+    let worker_pid = created["workerPid"].as_u64().unwrap() as u32;
+    let owner_client = created["ownerClientId"].as_str().unwrap().to_owned();
+
+    let closing = tokio::spawn(async move { lease.close().await });
+    let stopping_gate = fixture.wait_for_gate("cleanup-stopping").await;
+    assert_eq!(stopping_gate["role"], "daemon");
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+    fixture
+        .wait_for_observation("owner_disconnect_cleanup_begin")
+        .await;
+    let joined_cleanup = fixture.wait_for_observation("cleanup_join").await;
+    assert_eq!(joined_cleanup["reason"], "owner-disconnect");
+    assert_eq!(joined_cleanup["force"], false);
+    assert_eq!(joined_cleanup["status"], "stopping");
+
+    let stopping = wait_for_cleanup_status(&fixture, "stopping").await;
+    assert_ne!(stopping["clientId"], owner_client);
+    assert_eq!(stopping["ownerClientId"], owner_client);
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        0
+    );
+    assert!(process_exists(worker_pid));
+    assert!(fixture.descriptor_path.exists());
+
+    fixture.release("cleanup-stopping");
+    let settled_query = wait_for_cleanup_status(&fixture, "settled").await;
+    assert_ne!(settled_query["clientId"], owner_client);
+    let daemon = tokio::time::timeout(Duration::from_secs(6), closing)
+        .await
+        .expect("replacement nonowner cleanup proof is bounded")
+        .expect("close task did not panic")
+        .expect("settled nonowner proof returns daemon ownership");
+    wait_for_process_exit(host_pid).await;
+    wait_for_process_exit(worker_pid).await;
+    wait_for_path_absent(&fixture.descriptor_path).await;
+
+    assert_eq!(fixture.observation_count("complete_received"), 1);
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        1
+    );
+    let settled = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "cleanup_state" && value["status"] == "settled")
+        .unwrap();
+    assert_eq!(settled["workerAbsent"], true);
+    assert_eq!(settled["descriptorAbsent"], true);
+    daemon.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn nonowner_proves_settled_when_owning_response_dies_after_cleanup() {
+    let fixture = PrimeSessionFixtureBuilder::default()
+        .control(json!({"mode":"normal", "completeResponse":"stuck"}))
+        .build();
+    let daemon = start(&fixture).await;
+    let lease = daemon
+        .create_session(session_config(&fixture))
+        .await
+        .expect("session opens");
+    let host_pid = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "public_module_import" && value["role"] == "session_host")
+        .and_then(|value| value["pid"].as_u64())
+        .unwrap() as u32;
+    let created = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "session_created")
+        .unwrap();
+    let worker_pid = created["workerPid"].as_u64().unwrap() as u32;
+    let owner_client = created["ownerClientId"].as_str().unwrap().to_owned();
+
+    let closing = tokio::spawn(async move { lease.close().await });
+    fixture
+        .wait_for_observation("complete_response_stuck")
+        .await;
+    let cleanup_settled = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "cleanup_state" && value["status"] == "settled")
+        .expect("owning cleanup settled before its response became usable");
+    assert_eq!(cleanup_settled["workerAbsent"], true);
+    assert_eq!(cleanup_settled["descriptorAbsent"], true);
+    assert_eq!(fixture.observation_count("complete_response_sent"), 0);
+    assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+
+    let settled_query = wait_for_cleanup_status(&fixture, "settled").await;
+    assert_ne!(settled_query["clientId"], owner_client);
+    assert_eq!(settled_query["ownerClientId"], owner_client);
+    let daemon = tokio::time::timeout(Duration::from_secs(6), closing)
+        .await
+        .expect("post-settlement replacement proof is bounded")
+        .expect("close task did not panic")
+        .expect("settled replacement proof returns daemon ownership");
+    wait_for_process_exit(host_pid).await;
+    wait_for_process_exit(worker_pid).await;
+    wait_for_path_absent(&fixture.descriptor_path).await;
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        1
+    );
+    daemon.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_close_during_post_proof_dispose_reaps_without_second_cleanup() {
+    let fixture = PrimeSessionFixtureBuilder::default().build();
+    fixture.gate("dispose");
+    let daemon = start(&fixture).await;
+    let lease = daemon
+        .create_session(session_config(&fixture))
+        .await
+        .expect("session opens");
+    let daemon_pid = fixture.process_observation_pid("daemon_spawn");
+    let host_pid = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "public_module_import" && value["role"] == "session_host")
+        .and_then(|value| value["pid"].as_u64())
+        .unwrap() as u32;
+    let created = fixture
+        .observations()
+        .into_iter()
+        .find(|value| value["kind"] == "session_created")
+        .unwrap();
+    let worker_pid = created["workerPid"].as_u64().unwrap() as u32;
+    let owner_client = created["ownerClientId"].as_str().unwrap().to_owned();
+
+    let closing = tokio::spawn(async move { lease.close().await });
+    fixture.wait_for_gate("dispose").await;
+    assert_eq!(fixture.observation_count("complete_received"), 1);
+    assert_eq!(fixture.observation_count("complete_response_sent"), 1);
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        1
+    );
+    let observations = fixture.observations();
+    let settled = observations
+        .iter()
+        .position(|value| value["kind"] == "cleanup_state" && value["status"] == "settled")
+        .expect("raw owning cleanup settled");
+    let response = observation_index(&observations, "complete_response_sent");
+    let dispose = observation_index(&observations, "connection_dispose_begin");
+    assert!(settled < response && response < dispose, "{observations:?}");
+    closing.abort();
+    let joined = tokio::time::timeout(Duration::from_secs(2), closing)
+        .await
+        .expect("cancelled post-proof close settles");
+    assert!(matches!(joined, Err(error) if error.is_cancelled()));
+    let settled_query = wait_for_cleanup_status(&fixture, "settled").await;
+    assert_ne!(settled_query["clientId"], owner_client);
+    assert_eq!(settled_query["ownerClientId"], owner_client);
+
+    fixture
+        .wait_for_observation("daemon_shutdown_drained")
+        .await;
+    wait_for_process_exit(worker_pid).await;
+    wait_for_process_exit(host_pid).await;
+    wait_for_process_exit(daemon_pid).await;
+    wait_for_path_absent(&fixture.descriptor_path).await;
+    assert_eq!(fixture.observation_count("complete_received"), 1);
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn malformed_or_stuck_cleanup_status_is_exact_cleanup_uncertain_and_drains_daemon() {
     for cleanup_status in ["malformed", "stuck"] {
         let fixture = PrimeSessionFixtureBuilder::default().build();
@@ -709,6 +984,9 @@ async fn cancel_opening_at(stage: &str, expects_worker: bool) {
         .and_then(|value| value["workerPid"].as_u64())
         .map(|pid| pid as u32);
     assert_eq!(worker_pid.is_some(), expects_worker, "stage {stage}");
+    if stage == "module-load" {
+        assert_no_session_create(&fixture);
+    }
 
     opening.abort();
     let joined = tokio::time::timeout(Duration::from_secs(2), opening)
@@ -727,8 +1005,9 @@ async fn cancel_opening_at(stage: &str, expects_worker: bool) {
 }
 
 #[tokio::test]
-async fn cancellation_at_connect_precreate_attach_and_both_opening_snapshots_reaps_every_owner() {
+async fn cancellation_at_module_load_connect_precreate_attach_and_snapshots_reaps_every_owner() {
     for (stage, expects_worker) in [
+        ("module-load", false),
         ("connect", false),
         ("request-create", false),
         ("attach", true),
@@ -943,7 +1222,7 @@ async fn cancelling_cleanup_status_poll_keeps_known_owner_armed_until_reaper_shu
 }
 
 #[tokio::test]
-async fn cancelling_poison_daemon_shutdown_keeps_cleanup_armed_until_drain() {
+async fn cancelling_poison_shutdown_after_ack_cannot_bypass_registered_cleanup() {
     let fixture = PrimeSessionFixtureBuilder::default().build();
     let daemon = start(&fixture).await;
     let lease = daemon
@@ -951,7 +1230,7 @@ async fn cancelling_poison_daemon_shutdown_keeps_cleanup_armed_until_drain() {
         .await
         .expect("session opens");
     fixture.update_control(|control| control["cleanupStatus"] = json!("malformed"));
-    fixture.gate("daemon-shutdown");
+    fixture.gate("cleanup-stopping");
     let daemon_pid = fixture.process_observation_pid("daemon_spawn");
     let host_pid = fixture
         .observations()
@@ -966,14 +1245,62 @@ async fn cancelling_poison_daemon_shutdown_keeps_cleanup_armed_until_drain() {
         .and_then(|value| value["workerPid"].as_u64())
         .unwrap() as u32;
     assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+    fixture.wait_for_gate("cleanup-stopping").await;
+
     let closing = tokio::spawn(async move { lease.close().await });
-    fixture.wait_for_gate("daemon-shutdown").await;
+    let response = fixture
+        .wait_for_observation("daemon_shutdown_response")
+        .await;
+    assert_eq!(response["authoritative"], true);
+    let begin = fixture.wait_for_observation("daemon_shutdown_begin").await;
+    assert_eq!(begin["clientId"], response["clientId"]);
+    let joined_cleanup = fixture.wait_for_observation("cleanup_join").await;
+    assert_eq!(joined_cleanup["reason"], "daemon-shutdown-drain");
+    assert_eq!(joined_cleanup["force"], true);
+    assert_eq!(joined_cleanup["status"], "stopping");
+    let bootstrap_close = fixture.wait_for_observation("client_close").await;
+    assert_eq!(bootstrap_close["role"], "bootstrap_bridge");
+    let observations = fixture.observations();
+    assert!(
+        observation_index(&observations, "daemon_shutdown_response")
+            < observation_index(&observations, "daemon_shutdown_begin"),
+        "{observations:?}"
+    );
+    assert!(
+        !closing.is_finished(),
+        "Rust must be waiting for daemon exit after its ack"
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        0
+    );
+    assert_eq!(fixture.observation_count("daemon_shutdown_drained"), 0);
+    assert!(process_exists(daemon_pid));
+    assert!(process_exists(worker_pid));
+    assert!(fixture.descriptor_path.exists());
+
     closing.abort();
     let joined = tokio::time::timeout(Duration::from_secs(2), closing)
         .await
         .expect("cancelled poison shutdown settles");
     assert!(matches!(joined, Err(error) if error.is_cancelled()));
-    fixture.release("daemon-shutdown");
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        0
+    );
+    assert_eq!(fixture.observation_count("daemon_shutdown_drained"), 0);
+    assert!(process_exists(daemon_pid));
+    assert!(process_exists(worker_pid));
+    assert!(fixture.descriptor_path.exists());
+    fixture.release("cleanup-stopping");
 
     fixture
         .wait_for_observation("daemon_shutdown_drained")
@@ -982,6 +1309,118 @@ async fn cancelling_poison_daemon_shutdown_keeps_cleanup_armed_until_drain() {
     wait_for_process_exit(host_pid).await;
     wait_for_process_exit(daemon_pid).await;
     wait_for_path_absent(&fixture.descriptor_path).await;
+    assert_eq!(fixture.observation_count("daemon_shutdown_begin"), 1);
+    assert_eq!(fixture.observation_count("daemon_shutdown_drained"), 1);
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+        1
+    );
+    assert_eq!(
+        observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn rejected_poison_shutdown_response_cannot_kill_registered_cleanup_early() {
+    for response_mode in ["wrong-command", "failure"] {
+        let fixture = PrimeSessionFixtureBuilder::default()
+            .control(json!({
+                "mode":"normal",
+                "cleanupStatus":"malformed",
+                "shutdownResponse":response_mode,
+            }))
+            .build();
+        let daemon = start(&fixture).await;
+        let lease = daemon
+            .create_session(session_config(&fixture))
+            .await
+            .expect("session opens");
+        fixture.gate("cleanup-stopping");
+        let daemon_pid = fixture.process_observation_pid("daemon_spawn");
+        let host_pid = fixture
+            .observations()
+            .into_iter()
+            .find(|value| {
+                value["kind"] == "public_module_import" && value["role"] == "session_host"
+            })
+            .and_then(|value| value["pid"].as_u64())
+            .unwrap() as u32;
+        let created = fixture
+            .observations()
+            .into_iter()
+            .find(|value| value["kind"] == "session_created")
+            .unwrap();
+        let worker_pid = created["workerPid"].as_u64().unwrap() as u32;
+        let owner_client = created["ownerClientId"].as_str().unwrap().to_owned();
+        assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+        fixture.wait_for_gate("cleanup-stopping").await;
+
+        let closing = tokio::spawn(async move { lease.close().await });
+        let response = fixture
+            .wait_for_observation("daemon_shutdown_response")
+            .await;
+        assert_eq!(response["responseMode"], response_mode);
+        assert_eq!(response["authoritative"], false);
+        assert_ne!(response["clientId"], owner_client);
+        fixture.wait_for_observation("daemon_shutdown_begin").await;
+        let joined_cleanup = fixture.wait_for_observation("cleanup_join").await;
+        assert_eq!(joined_cleanup["reason"], "daemon-shutdown-drain");
+        assert_eq!(joined_cleanup["force"], true);
+        assert_eq!(joined_cleanup["status"], "stopping");
+        let observations = fixture.observations();
+        assert!(
+            observation_index(&observations, "daemon_shutdown_response")
+                < observation_index(&observations, "daemon_shutdown_begin"),
+            "{observations:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !closing.is_finished(),
+            "{response_mode} shutdown rejection killed the supervisor before its cleanup flight"
+        );
+        assert!(process_exists(daemon_pid));
+        assert!(process_exists(worker_pid));
+        assert!(fixture.descriptor_path.exists());
+        assert_eq!(fixture.observation_count("daemon_shutdown_begin"), 1);
+        assert_eq!(fixture.observation_count("daemon_shutdown_drained"), 0);
+        assert_eq!(
+            observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+            1
+        );
+        assert_eq!(
+            observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+            0
+        );
+
+        fixture.release("cleanup-stopping");
+        let error = tokio::time::timeout(Duration::from_secs(7), closing)
+            .await
+            .expect("rejected shutdown cleanup remains bounded")
+            .expect("close task did not panic")
+            .err()
+            .expect("a non-authoritative shutdown response remains cleanup-uncertain");
+        assert!(matches!(error, PrimeDaemonError::CleanupUncertain));
+        assert_error_private(&fixture, &error);
+        fixture
+            .wait_for_observation("daemon_shutdown_drained")
+            .await;
+        wait_for_process_exit(worker_pid).await;
+        wait_for_process_exit(host_pid).await;
+        wait_for_process_exit(daemon_pid).await;
+        wait_for_path_absent(&fixture.descriptor_path).await;
+        assert_eq!(fixture.observation_count("daemon_shutdown_begin"), 1);
+        assert_eq!(fixture.observation_count("daemon_shutdown_drained"), 1);
+        assert_eq!(
+            observation_field_count(&fixture, "cleanup_state", "status", "stopping"),
+            1
+        );
+        assert_eq!(
+            observation_field_count(&fixture, "cleanup_state", "status", "settled"),
+            1
+        );
+    }
 }
 
 async fn raw_host_exchange(
